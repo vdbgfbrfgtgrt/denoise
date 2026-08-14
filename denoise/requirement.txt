@@ -1,8 +1,0 @@
-# DFGU-Net dependencies
-# Install with:  pip install -r requirement.txt
-
-torch>=1.13
-torchvision>=0.14
-numpy>=1.21
-scipy>=1.7
-Pillow>=9.0
