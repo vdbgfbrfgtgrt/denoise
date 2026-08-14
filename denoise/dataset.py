@@ -6,9 +6,12 @@ of images. To stay flexible across different real-world layouts we try
 several conventions:
 
   - paired layout  : <root>/clean  + <root>/noisy  (or gt/input, target/source)
+                     - also detected recursively at any depth, e.g.
+                       <root>/<group>/clean + <root>/<group>/noisy
   - flat layout    : <root>/*.png (treated as clean targets; noise is added
                      on-the-fly via the neutron noise simulator)
-  - sub-dirs layout: <root>/<sub>/*.png  with sibling clean/noisy subdirs
+  - recursive flat : <root>/**/*.png (images in nested sub-directories are
+                     all collected and treated as clean targets)
 
 If a clean/noisy pair is found, the noisy image is used as-is (no further
 synthetic noise is added). Otherwise synthetic neutron noise is added to
@@ -37,10 +40,24 @@ def _is_image(name: str) -> bool:
     return name.lower().endswith(IMG_EXTENSIONS)
 
 
-def _list_images(folder: str) -> List[str]:
+def _list_images(folder: str, recursive: bool = True) -> List[str]:
+    """List image files under ``folder``.
+
+    When ``recursive`` is True (default), the scan descends into all
+    sub-directories. This handles real-world datasets where images are
+    nested under group/sequence folders.
+    """
     if not os.path.isdir(folder):
         return []
-    return sorted(os.path.join(folder, f) for f in os.listdir(folder) if _is_image(f))
+    out: List[str] = []
+    if recursive:
+        for dirpath, _dirnames, filenames in os.walk(folder):
+            for f in filenames:
+                if _is_image(f):
+                    out.append(os.path.join(dirpath, f))
+    else:
+        out = [os.path.join(folder, f) for f in os.listdir(folder) if _is_image(f)]
+    return sorted(out)
 
 
 # Possible sub-directory name pairs for paired layouts.
@@ -49,7 +66,13 @@ NOISY_NAMES = ("noisy", "input", "source", "low", "degraded")
 
 
 def _detect_paired_layout(root: str) -> Optional[Tuple[str, str]]:
-    """Detect <root>/clean + <root>/noisy style layout."""
+    """Detect clean/noisy sibling directories.
+
+    Searches first at the top level, then recursively one level down to
+    support layouts like ``<root>/<group>/clean`` + ``<root>/<group>/noisy``.
+    Returns the first matching ``(clean_dir, noisy_dir)`` tuple or None.
+    """
+    # 1) Top-level siblings.
     entries = [d for d in os.listdir(root)
                if os.path.isdir(os.path.join(root, d))]
     lowers = {e.lower(): e for e in entries}
@@ -57,6 +80,19 @@ def _detect_paired_layout(root: str) -> Optional[Tuple[str, str]]:
     noisy_dir = next((lowers[n] for n in NOISY_NAMES if n in lowers), None)
     if clean_dir and noisy_dir:
         return os.path.join(root, clean_dir), os.path.join(root, noisy_dir)
+
+    # 2) One level down: <root>/<group>/clean + <root>/<group>/noisy.
+    for entry in entries:
+        sub = os.path.join(root, entry)
+        if not os.path.isdir(sub):
+            continue
+        sub_entries = [d for d in os.listdir(sub)
+                       if os.path.isdir(os.path.join(sub, d))]
+        sub_lowers = {e.lower(): e for e in sub_entries}
+        c = next((sub_lowers[n] for n in CLEAN_NAMES if n in sub_lowers), None)
+        n = next((sub_lowers[m] for m in NOISY_NAMES if m in sub_lowers), None)
+        if c and n:
+            return os.path.join(sub, c), os.path.join(sub, n)
     return None
 
 
@@ -131,11 +167,32 @@ class NeutronDenoiseDataset(Dataset):
             self.items = self.items[:max_samples]
 
         if len(self.items) == 0:
+            # Build a helpful diagnostic of what *was* found under root.
+            try:
+                all_entries = []
+                for dirpath, dirnames, filenames in os.walk(root):
+                    rel = os.path.relpath(dirpath, root)
+                    imgs = [f for f in filenames if _is_image(f)]
+                    if imgs or dirnames:
+                        all_entries.append(
+                            f"  {rel}/  ({len(imgs)} images, "
+                            f"subdirs: {dirnames[:5]})"
+                        )
+                diag = "\n".join(all_entries[:20]) or "  (empty)"
+            except Exception:
+                diag = "  (unable to scan)"
             raise RuntimeError(
-                f"No images found under {root!r}. "
-                f"Expected either a paired layout (clean/noisy subdirs) "
-                f"or a flat folder of images."
+                f"No images found under {root!r}.\n"
+                f"Supported layouts:\n"
+                f"  - flat        : <root>/*.png or <root>/**/*.png\n"
+                f"  - paired      : <root>/clean + <root>/noisy\n"
+                f"  - nested pair : <root>/<group>/clean + <root>/<group>/noisy\n"
+                f"Directory scan:\n{diag}"
             )
+
+        if not getattr(self, "_quiet", False):
+            print(f"[dataset] {len(self.items)} images loaded from {root!r} "
+                  f"(paired={self.paired})", flush=True)
 
     def __len__(self) -> int:
         return len(self.items)
